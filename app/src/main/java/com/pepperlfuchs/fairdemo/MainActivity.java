@@ -2,23 +2,21 @@ package com.pepperlfuchs.fairdemo;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
-import android.graphics.Rect;
-import android.media.Image;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Size;
 import android.view.View;
-import android.view.Window;
 import android.view.WindowManager;
 
 import androidx.activity.ComponentActivity;
-import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.annotation.OptIn;
+import androidx.annotation.NonNull;
 import androidx.camera.core.CameraSelector;
-import androidx.camera.core.ExperimentalGetImage;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.common.util.concurrent.ListenableFuture;
@@ -33,57 +31,48 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends ComponentActivity {
-    private MascotView mascotView;
+    private static final int REQ_CAMERA = 42;
+    private RobotView robotView;
     private ExecutorService cameraExecutor;
     private FaceDetector faceDetector;
-
-    private final ActivityResultLauncher<String> cameraPermission =
-            registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {
-                if (granted) {
-                    mascotView.setCameraReady(true);
-                    startCamera();
-                } else {
-                    mascotView.setCameraReady(false);
-                }
-            });
+    private volatile boolean processing = false;
+    private long lastFaceAt = 0L;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        enterKioskLook();
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        hideSystemUi();
 
-        mascotView = new MascotView(this);
-        setContentView(mascotView);
+        byte[] bytes = android.util.Base64.decode(RobotAsset.JPG_BASE64, android.util.Base64.DEFAULT);
+        Bitmap robot = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        robotView = new RobotView(this, robot);
+        setContentView(robotView);
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         FaceDetectorOptions options = new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                .setMinFaceSize(0.12f)
                 .enableTracking()
+                .setMinFaceSize(0.12f)
                 .build();
         faceDetector = FaceDetection.getClient(options);
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            mascotView.setCameraReady(true);
             startCamera();
         } else {
-            mascotView.setCameraReady(false);
-            cameraPermission.launch(Manifest.permission.CAMERA);
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
         }
     }
 
-    private void enterKioskLook() {
-        Window window = getWindow();
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        window.setStatusBarColor(0xFFF7F7F5);
-        window.setNavigationBarColor(0xFFF7F7F5);
-        window.getDecorView().setSystemUiVisibility(
+    private void hideSystemUi() {
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
                 View.SYSTEM_UI_FLAG_FULLSCREEN |
                 View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        );
     }
 
     private void startCamera() {
@@ -97,83 +86,85 @@ public class MainActivity extends ComponentActivity {
                         .build();
                 analysis.setAnalyzer(cameraExecutor, this::analyzeFrame);
 
-                provider.unbindAll();
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis);
+                CameraSelector selector = CameraSelector.DEFAULT_FRONT_CAMERA;
+                try {
+                    provider.unbindAll();
+                    provider.bindToLifecycle(this, selector, analysis);
+                    robotView.setFrontCamera(true);
+                } catch (Exception frontError) {
+                    provider.unbindAll();
+                    provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysis);
+                    robotView.setFrontCamera(false);
+                }
             } catch (Exception e) {
-                mascotView.post(() -> mascotView.setCameraReady(false));
+                robotView.setCameraError(true);
             }
         }, ContextCompat.getMainExecutor(this));
     }
 
-    @OptIn(markerClass = ExperimentalGetImage.class)
-    private void analyzeFrame(ImageProxy imageProxy) {
-        Image mediaImage = imageProxy.getImage();
-        if (mediaImage == null) {
-            imageProxy.close();
+    private void analyzeFrame(@NonNull ImageProxy proxy) {
+        if (processing || proxy.getImage() == null) {
+            proxy.close();
             return;
         }
+        processing = true;
+        int rotation = proxy.getImageInfo().getRotationDegrees();
+        InputImage input = InputImage.fromMediaImage(proxy.getImage(), rotation);
 
-        int rotation = imageProxy.getImageInfo().getRotationDegrees();
-        InputImage image = InputImage.fromMediaImage(mediaImage, rotation);
-        int frameW = (rotation == 90 || rotation == 270) ? imageProxy.getHeight() : imageProxy.getWidth();
-        int frameH = (rotation == 90 || rotation == 270) ? imageProxy.getWidth() : imageProxy.getHeight();
-
-        faceDetector.process(image)
-                .addOnSuccessListener(faces -> handleFaces(faces, frameW, frameH))
-                .addOnFailureListener(e -> mascotView.post(mascotView::noFace))
-                .addOnCompleteListener(task -> imageProxy.close());
+        faceDetector.process(input)
+                .addOnSuccessListener(faces -> onFaces(faces, proxy.getWidth(), proxy.getHeight(), rotation))
+                .addOnFailureListener(e -> { })
+                .addOnCompleteListener(task -> {
+                    processing = false;
+                    proxy.close();
+                });
     }
 
-    private void handleFaces(List<Face> faces, int frameWpx, int frameHpx) {
+    private void onFaces(List<Face> faces, int rawW, int rawH, int rotation) {
         if (faces == null || faces.isEmpty()) {
-            mascotView.post(mascotView::noFace);
+            if (SystemClock.elapsedRealtime() - lastFaceAt > 900) robotView.faceLost();
             return;
         }
 
-        Face best = null;
-        int bestArea = -1;
-        for (Face face : faces) {
-            Rect r = face.getBoundingBox();
-            int area = Math.max(1, r.width()) * Math.max(1, r.height());
-            if (area > bestArea) {
-                bestArea = area;
-                best = face;
-            }
+        Face best = faces.get(0);
+        float bestArea = 0f;
+        for (Face f : faces) {
+            float a = f.getBoundingBox().width() * f.getBoundingBox().height();
+            if (a > bestArea) { best = f; bestArea = a; }
         }
-        if (best == null) return;
 
-        Rect r = best.getBoundingBox();
-        float frameW = Math.max(1f, frameWpx);
-        float frameH = Math.max(1f, frameHpx);
+        int iw = (rotation == 90 || rotation == 270) ? rawH : rawW;
+        int ih = (rotation == 90 || rotation == 270) ? rawW : rawH;
+        float cx = best.getBoundingBox().exactCenterX();
+        float cy = best.getBoundingBox().exactCenterY();
+        float nx = ((cx / Math.max(1f, iw)) - 0.5f) * 2f;
+        float ny = ((cy / Math.max(1f, ih)) - 0.5f) * 2f;
+        float size = best.getBoundingBox().width() / Math.max(1f, iw);
 
-        float nx = ((r.centerX() / frameW) - 0.5f) * 2f;
-        float ny = ((r.centerY() / frameH) - 0.5f) * 2f;
-
-        nx = -nx;
-        nx = clamp(nx, -1f, 1f);
-        ny = clamp(ny, -1f, 1f);
-
-        float size = (float) Math.sqrt((r.width() * r.height()) / (frameW * frameH));
-        float finalNx = nx;
-        float finalNy = ny;
-        float finalSize = clamp(size, 0.05f, 0.55f);
-        mascotView.post(() -> mascotView.trackFace(finalNx, finalNy, finalSize));
+        lastFaceAt = SystemClock.elapsedRealtime();
+        robotView.trackFace(nx, ny, size, best.getHeadEulerAngleY(), best.getHeadEulerAngleZ());
     }
 
-    private static float clamp(float v, float min, float max) {
-        return Math.max(min, Math.min(max, v));
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_CAMERA && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startCamera();
+        } else {
+            robotView.setCameraError(true);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        enterKioskLook();
+        hideSystemUi();
     }
 
     @Override
     protected void onDestroy() {
-        if (cameraExecutor != null) cameraExecutor.shutdown();
-        if (faceDetector != null) faceDetector.close();
         super.onDestroy();
+        if (faceDetector != null) faceDetector.close();
+        if (cameraExecutor != null) cameraExecutor.shutdown();
     }
 }
